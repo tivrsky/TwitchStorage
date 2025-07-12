@@ -7,12 +7,14 @@
     "activeTab",
     "storage",
     "downloads",
-    "webRequest"
+    "webRequest",
+    "scripting"
   ],
   "host_permissions": [
     "https://www.twitch.tv/*",
     "https://usher.ttvnw.net/*",
-    "https://video-weaver.*.hls.ttvnw.net/*"
+    "https://video-weaver.*.hls.ttvnw.net/*",
+    "https://*.ttvnw.net/*"
   ],
   "background": {
     "service_worker": "background.js"
