@@ -4,19 +4,30 @@ let recordingState = {
   isRecording: false,
   streamData: null,
   chunks: [],
-  downloadId: null
+  downloadId: null,
+  settings: {
+    saveFormat: 'ts', // ts, mp4
+    quality: 'best',
+    duration: 0, // 0 = 無制限、その他は分単位
+    saveLocation: 'downloads'
+  }
 };
 
 // 拡張機能のインストール時
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('Twitch Stream Saver installed');
+  // 設定を初期化
+  chrome.storage.sync.get(['saverSettings'], function(result) {
+    if (result.saverSettings) {
+      recordingState.settings = { ...recordingState.settings, ...result.saverSettings };
+    }
+  });
 });
 
 // メッセージリスナー
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   switch (request.action) {
     case 'startRecording':
-      startRecording(request.streamData);
+      startRecording(request.streamData, request.settings);
       break;
     case 'stopRecording':
       stopRecording();
@@ -24,20 +35,37 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     case 'getRecordingStatus':
       sendResponse({
         isRecording: recordingState.isRecording,
-        streamData: recordingState.streamData
+        streamData: recordingState.streamData,
+        settings: recordingState.settings
       });
+      break;
+    case 'updateSettings':
+      updateSettings(request.settings);
+      sendResponse({success: true});
+      break;
+    case 'getSettings':
+      sendResponse({settings: recordingState.settings});
       break;
   }
 });
 
+// 設定更新
+function updateSettings(newSettings) {
+  recordingState.settings = { ...recordingState.settings, ...newSettings };
+  chrome.storage.sync.set({ saverSettings: recordingState.settings });
+}
+
 // 録画開始
-async function startRecording(streamData) {
+async function startRecording(streamData, settings = {}) {
   try {
     recordingState.isRecording = true;
     recordingState.streamData = streamData;
     recordingState.chunks = [];
     
-    console.log('録画開始:', streamData);
+    // 設定を更新
+    if (settings) {
+      recordingState.settings = { ...recordingState.settings, ...settings };
+    }
     
     // HLS ストリームの処理
     if (streamData.url) {
@@ -47,7 +75,7 @@ async function startRecording(streamData) {
   } catch (error) {
     console.error('録画開始エラー:', error);
     recordingState.isRecording = false;
-    notifyRecordingStatus('error');
+    notifyRecordingStatus('error', error.message);
   }
 }
 
@@ -59,7 +87,6 @@ function stopRecording() {
     chrome.downloads.cancel(recordingState.downloadId);
   }
   
-  console.log('録画停止');
   notifyRecordingStatus('stopped');
 }
 
@@ -79,12 +106,12 @@ async function downloadHLSStream(streamData) {
       throw new Error('セグメントが見つかりません');
     }
     
-    // 最初のセグメントをダウンロード（テスト用）
+    // 最初のセグメントをダウンロード
     const firstSegment = segments[0];
     const segmentUrl = resolveURL(streamData.url, firstSegment);
     
-    // ダウンロード開始
-    const filename = generateFilename(streamData);
+    // ファイル名を生成
+    const filename = generateFilename(streamData, recordingState.settings);
     
     chrome.downloads.download({
       url: segmentUrl,
@@ -93,17 +120,16 @@ async function downloadHLSStream(streamData) {
     }, (downloadId) => {
       if (chrome.runtime.lastError) {
         console.error('ダウンロードエラー:', chrome.runtime.lastError);
-        notifyRecordingStatus('error');
+        notifyRecordingStatus('error', chrome.runtime.lastError.message);
       } else {
         recordingState.downloadId = downloadId;
-        console.log('ダウンロード開始:', downloadId);
         notifyRecordingStatus('started');
       }
     });
     
   } catch (error) {
     console.error('HLS ダウンロードエラー:', error);
-    notifyRecordingStatus('error');
+    notifyRecordingStatus('error', error.message);
   }
 }
 
@@ -133,19 +159,40 @@ function resolveURL(baseUrl, relativePath) {
 }
 
 // ファイル名の生成
-function generateFilename(streamData) {
+function generateFilename(streamData, settings) {
   const now = new Date();
   const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const channelName = streamData.channelName || 'unknown';
+  const title = streamData.streamInfo?.title || '';
+  const category = streamData.streamInfo?.category || '';
   
-  return `twitch-${channelName}-${timestamp}.ts`;
+  // ファイル名テンプレート
+  let filename = `${channelName}-${timestamp}`;
+  
+  // タイトルを追加（ファイル名に使用できない文字を除去）
+  if (title) {
+    const safeTitle = title.replace(/[<>:"/\\|?*]/g, '').substring(0, 50);
+    filename = `${channelName}-${safeTitle}-${timestamp}`;
+  }
+  
+  // 拡張子を追加
+  const extension = settings.saveFormat === 'mp4' ? 'mp4' : 'ts';
+  filename += `.${extension}`;
+  
+  // 保存先フォルダを追加
+  if (settings.saveLocation && settings.saveLocation !== 'downloads') {
+    filename = `${settings.saveLocation}/${filename}`;
+  }
+  
+  return filename;
 }
 
 // 録画状態の通知
-function notifyRecordingStatus(status) {
+function notifyRecordingStatus(status, message = '') {
   chrome.runtime.sendMessage({
     action: 'recordingStatus',
-    status: status
+    status: status,
+    message: message
   }).catch(() => {
     // ポップアップが閉じられている場合はエラーを無視
   });
@@ -155,13 +202,11 @@ function notifyRecordingStatus(status) {
 chrome.downloads.onChanged.addListener((delta) => {
   if (delta.id === recordingState.downloadId) {
     if (delta.state && delta.state.current === 'complete') {
-      console.log('ダウンロード完了');
       recordingState.isRecording = false;
       notifyRecordingStatus('completed');
     } else if (delta.state && delta.state.current === 'interrupted') {
-      console.log('ダウンロード中断');
       recordingState.isRecording = false;
-      notifyRecordingStatus('error');
+      notifyRecordingStatus('error', 'ダウンロードが中断されました');
     }
   }
 });
@@ -170,8 +215,6 @@ chrome.downloads.onChanged.addListener((delta) => {
 chrome.webRequest.onBeforeRequest.addListener(
   function(details) {
     if (details.url.includes('.m3u8') || details.url.includes('usher.ttvnw.net')) {
-      console.log('HLS URL detected:', details.url);
-      
       // アクティブなタブに通知
       chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
         if (tabs[0]) {
@@ -189,17 +232,21 @@ chrome.webRequest.onBeforeRequest.addListener(
   ["requestBody"]
 );
 
-// アラーム設定（定期的な処理用）
+// 定期的な録画時間制限チェック
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'checkRecording') {
-    if (recordingState.isRecording) {
-      console.log('録画状態チェック:', recordingState);
+  if (alarm.name === 'recordingTimeLimit') {
+    if (recordingState.isRecording && recordingState.settings.duration > 0) {
+      stopRecording();
+      notifyRecordingStatus('completed', '設定された時間に達したため録画を停止しました');
     }
   }
 });
 
-// 定期チェックの設定
-chrome.alarms.create('checkRecording', {
-  delayInMinutes: 1,
-  periodInMinutes: 1
-});
+// 録画時間制限の設定
+function setRecordingTimeLimit(minutes) {
+  if (minutes > 0) {
+    chrome.alarms.create('recordingTimeLimit', {
+      delayInMinutes: minutes
+    });
+  }
+}
